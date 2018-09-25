@@ -28,7 +28,7 @@ PseudoCamera::PseudoCamera(const std::string& _data_path) :
     cam_params_stream >> cam_params.principal_x >> cam_params.principal_y;
 };
 
-InputFrame PseudoCamera::grab_frame () const
+InputFrame PseudoCamera::grab_frame ()
 {
     std::stringstream depth_file;
     depth_file << data_path << "seq_depth" << std::setfill('0') << std::setw(5) << current_index << ".png";
@@ -149,7 +149,7 @@ XtionCamera::XtionCamera() :
     cam_params = cp;
 }
 
-InputFrame XtionCamera::grab_frame() const
+InputFrame XtionCamera::grab_frame()
 {
     depthStream.readFrame(&depthFrame);
     colorStream.readFrame(&colorFrame);
@@ -183,7 +183,9 @@ CameraParameters XtionCamera::get_parameters() const
 }
 
 // ### Intel RealSense
-RealSenseCamera::RealSenseCamera() : pipeline{}
+RealSenseCamera::RealSenseCamera()
+    : pipeline{}
+    , aligner(RS2_STREAM_COLOR)
 {
     // Explicitly enable depth and color stream, with these constraints:
     // Same dimensions and color stream has format BGR 8bit
@@ -219,7 +221,7 @@ RealSenseCamera::RealSenseCamera() : pipeline{}
     // Get depth sensor intrinsics
     auto streams = pipeline.get_active_profile().get_streams();
     for(const auto& stream : streams) {
-        if(stream.stream_type() == RS2_STREAM_DEPTH) {
+        if(stream.stream_type() == RS2_STREAM_COLOR) {
             auto intrinsics = stream.as<rs2::video_stream_profile>().get_intrinsics();
             cam_params.focal_x = intrinsics.fx;
             cam_params.focal_y = intrinsics.fy;
@@ -232,9 +234,15 @@ RealSenseCamera::RealSenseCamera() : pipeline{}
 
     // Get depth scale which is used to convert the measurements into millimeters
     depth_scale = pipeline.get_active_profile().get_device().first<rs2::depth_sensor>().get_depth_scale();
+
+    working_buf = new uint16_t[cam_params.image_width * cam_params.image_height];
+    
+    idw_kernel = makeIDWKernel(5);
 }
 
-RealSenseCamera::RealSenseCamera(const std::string& filename) : pipeline{}
+RealSenseCamera::RealSenseCamera(const std::string& filename) 
+    : pipeline{}
+    , aligner(RS2_STREAM_COLOR)
 {
     rs2::config configuration {};
     configuration.disable_all_streams();
@@ -258,17 +266,30 @@ RealSenseCamera::RealSenseCamera(const std::string& filename) : pipeline{}
     depth_scale = pipeline.get_active_profile().get_device().first<rs2::depth_sensor>().get_depth_scale();
 }
 
-InputFrame RealSenseCamera::grab_frame() const
+RealSenseCamera::~RealSenseCamera()
+{
+    if( working_buf ){
+        delete[] working_buf;
+    }
+}
+
+InputFrame RealSenseCamera::grab_frame()
 {
     auto data = pipeline.wait_for_frames();
-    auto depth = data.get_depth_frame();
-    auto color = data.get_color_frame();
+
+    auto processed = aligner.process(data);
+
+    auto depth = processed.get_depth_frame();
+    auto color = processed.get_color_frame();
 
     cv::Mat depth_image { cv::Size { cam_params.image_width,
                                      cam_params.image_height },
                           CV_16UC1,
                           const_cast<void*>(depth.get_data()),
                           cv::Mat::AUTO_STEP};
+
+    // need hole-filling before we can use the depth map
+    IDW_hole_fill(depth_image);
 
     cv::Mat converted_depth_image;
     depth_image.convertTo(converted_depth_image, CV_32FC1, depth_scale * 1000.f);
@@ -283,6 +304,87 @@ InputFrame RealSenseCamera::grab_frame() const
             converted_depth_image,
             color_image
     };
+}
+
+std::vector<std::vector<float>> RealSenseCamera::makeIDWKernel(
+    const int& size
+) const {
+    std::vector<std::vector<float>> ret(size, std::vector<float>(size, 0.0));
+    for(int y=0 ; y<size ; ++y)
+    {
+        for(int x=0 ; x<size ; ++x)
+        {
+            ret[y][x] = 1.0 / sqrt(
+                (y-(size/2))*(y-(size/2))+
+                (x-(size/2))*(x-(size/2))
+            );
+        }
+    }
+    return ret;
+}
+
+uint16_t RealSenseCamera::get_IDW_value(
+    const int& x, const int& y,
+    const uint16_t* out_z,
+    const int& src_width, const int& src_height
+) const {
+    const auto& kernel  = idw_kernel;
+    float weighted_sum = 0;
+    float total_dist = 0;
+    for(size_t ky = 0 ; ky < kernel.size() ; ++ky)
+    {
+        int ky_offset = ky - static_cast<int>(kernel.size())/2;
+        for(size_t kx = 0 ; kx < kernel.front().size() ; ++kx)
+        {
+            int kx_offset = kx - static_cast<int>(kernel.front().size())/2;
+            if( y + ky_offset < 0 || x + kx_offset < 0 || y + ky_offset >= src_height || x + kx_offset >= src_width )
+            {
+                continue;
+            }
+            uint16_t ref_val = out_z[(y + ky_offset)*src_width+(x + kx_offset)];
+            if( ref_val )
+            {
+                weighted_sum += kernel[ky][kx]*(float)ref_val;
+                total_dist += kernel[ky][kx];
+            }
+        }
+    }
+    return ( total_dist == 0 ) ? 0 :static_cast<uint16_t>(weighted_sum/total_dist);
+}
+
+void RealSenseCamera::IDW_hole_fill(cv::Mat& depth_map)
+{
+    // #pragma omp parallel for num_threads(num_of_threads_)
+    for (int other_y = 0; other_y < cam_params.image_height; ++other_y)
+    {
+        int other_pixel_index = other_y * cam_params.image_width;
+        for (int other_x = 0; other_x < cam_params.image_width; ++other_x, ++other_pixel_index)
+        {
+            uint16_t* data = depth_map.ptr<uint16_t>();
+            if( !data[other_pixel_index] )
+            {
+                // produce interpolation result and store in p_working_buf
+                working_buf[other_pixel_index] = get_IDW_value(
+                    other_x, other_y,
+                    data, cam_params.image_width, cam_params.image_height                      
+                );
+            }
+        }
+    }
+
+    // #pragma omp parallel for num_threads(num_of_threads_)
+    for (int other_y = 0; other_y < cam_params.image_height; ++other_y)
+    {
+        int other_pixel_index = other_y * cam_params.image_width;
+        for (int other_x = 0; other_x < cam_params.image_width; ++other_x, ++other_pixel_index)
+        {
+            uint16_t* data = depth_map.ptr<uint16_t>();
+            if( !data[other_pixel_index] )
+            {
+                data[other_pixel_index] = working_buf[other_pixel_index];
+            }
+        }
+    }
 }
 
 CameraParameters RealSenseCamera::get_parameters() const

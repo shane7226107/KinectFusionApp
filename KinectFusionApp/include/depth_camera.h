@@ -37,7 +37,7 @@ class DepthCamera {
 public:
     virtual ~DepthCamera() = default;
 
-    virtual InputFrame grab_frame() const = 0;
+    virtual InputFrame grab_frame() = 0;
     virtual CameraParameters get_parameters() const = 0;
 };
 
@@ -49,7 +49,7 @@ public:
     explicit PseudoCamera(const std::string& _data_path);
     ~PseudoCamera() override = default;
 
-    InputFrame grab_frame() const override;
+    InputFrame grab_frame() override;
     CameraParameters get_parameters() const override;
 
 private:
@@ -66,7 +66,7 @@ public:
     XtionCamera();
     ~XtionCamera() override = default;
 
-    InputFrame grab_frame() const override;
+    InputFrame grab_frame() override;
 
     CameraParameters get_parameters() const override;
 
@@ -88,17 +88,35 @@ public:
     RealSenseCamera();
     RealSenseCamera(const std::string& filename);
 
-    ~RealSenseCamera() override = default;
+    ~RealSenseCamera() override;
 
-    InputFrame grab_frame() const override;
+    InputFrame grab_frame() override;
 
     CameraParameters get_parameters() const override;
 
 private:
+
+    std::vector<std::vector<float>> makeIDWKernel(
+        const int& size
+    ) const;
+
+    uint16_t get_IDW_value(
+        const int& x, const int& y,
+        const uint16_t* out_z,
+        const int& src_width, const int& src_height
+    ) const;
+
+    void IDW_hole_fill(cv::Mat& depth_map);
+
     rs2::pipeline pipeline;
+    rs2::align aligner;
+
     CameraParameters cam_params;
 
     float depth_scale;
+
+    uint16_t* working_buf = nullptr;
+    std::vector<std::vector<float>> idw_kernel;
 };
 
 
